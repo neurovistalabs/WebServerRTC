@@ -106,6 +106,16 @@ function handleLogin(ws, message) {
 
     console.log(`✅ Login exitoso: ${deviceId} (${ws.role}) unido a isla ${islandId}`);
 
+    // Enviar configuración de servidores ICE (STUN/TURN)
+    const iceServers = config.ice_servers || [];
+    if (iceServers.length > 0) {
+        ws.send(JSON.stringify({
+            type: 'ice-servers',
+            servers: iceServers
+        }));
+        console.log(`❄️ Enviados ${iceServers.length} servidores ICE a ${deviceId}`);
+    }
+
     // Enviar confirmación (opcional)
     ws.send(JSON.stringify({ type: 'login-success', message: 'Conectado a la isla' }));
 }
