@@ -1,8 +1,9 @@
-// Servidor de señalización WebRTC con Arquitectura de Islas
+// Servidor de señalización WebRTC con Arquitectura de Islas y Jerarquía Familiar
 const WebSocket = require('ws');
 const fs = require('fs');
+const crypto = require('crypto');
 
-// Cargar configuración
+// --- Configuración ---
 let config = { port: 8080 };
 try {
     const rawConfig = fs.readFileSync('./server_config.json');
@@ -14,46 +15,74 @@ try {
 
 const PORT = process.env.PORT || config.port || 8080;
 const server = new WebSocket.Server({ port: PORT });
-console.log(`🚀 Servidor de Islas WebRTC iniciado en puerto ${PORT}`);
+console.log(`🚀 Servidor WebRTC (Familia/Roles) iniciado en puerto ${PORT}`);
 
-// Estructura de datos:
-// islands = {
-//   'island_id': {
-//      'device_id': { ws: socket, role: 'MOTHER'|'CHILD' }
-//   }
-// }
-const islands = {};
+// --- Persistencia (Mini-DB JSON) ---
+const DEVICES_FILE = './devices.json';
+const USERS_FILE = './users.json';
+
+let devicesDB = {}; // { device_id: { brand, model, os, ... } }
+let usersDB = {};   // { user_id: { name, familyId, role, deviceId } }
+
+function loadDB() {
+    try {
+        if (fs.existsSync(DEVICES_FILE)) devicesDB = JSON.parse(fs.readFileSync(DEVICES_FILE));
+        if (fs.existsSync(USERS_FILE)) usersDB = JSON.parse(fs.readFileSync(USERS_FILE));
+        console.log(`📚 DB cargada: ${Object.keys(devicesDB).length} dispositivos, ${Object.keys(usersDB).length} usuarios`);
+    } catch (e) {
+        console.error('❌ Error cargando DB:', e);
+    }
+}
+loadDB();
+
+function saveDevices() {
+    fs.writeFileSync(DEVICES_FILE, JSON.stringify(devicesDB, null, 2));
+}
+
+function saveUsers() {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(usersDB, null, 2));
+}
+
+// --- Lógica de Negocio ---
+// connections = { socket: ws, deviceId: '...', userId: '...' }
+// Se mantiene referencia en el objeto 'ws' directamente para acceso rápido
+const clients = new Set();
 
 server.on('connection', function connection(ws, request) {
     const clientIP = request.socket.remoteAddress;
-    console.log(`📱 Nueva conexión desde ${clientIP}`);
+    console.log(`📱 Nueva conexión física desde ${clientIP}`);
 
-    // Metadatos temporales hasta que haga login
-    ws.isLogued = false;
-    ws.islandId = null;
+    ws.isAlive = true;
     ws.deviceId = null;
+    ws.userId = null;
+    ws.familyId = null;
     ws.role = null;
+
+    clients.add(ws);
 
     ws.on('message', function incoming(data) {
         try {
             const message = JSON.parse(data.toString());
 
-            // 1. Manejo de LOGIN
-            if (message.type === 'login') {
-                handleLogin(ws, message);
-                return;
+            switch (message.type) {
+                case 'register_device':
+                    handleDeviceRegister(ws, message);
+                    break;
+                case 'login_user':
+                    handleUserLogin(ws, message);
+                    break;
+                case 'get_online_users':
+                    handleGetOnlineUsers(ws);
+                    break;
+                case 'offer':
+                case 'answer':
+                case 'ice-candidate':
+                case 'call_request':
+                    routeSignalingMessage(ws, message);
+                    break;
+                default:
+                    console.warn(`Mensaje desconocido de ${ws.deviceId}: ${message.type}`);
             }
-
-            // Si no está logueado, ignorar otros mensajes
-            if (!ws.isLogued) {
-                console.warn(`⚠️ Mensaje ignorado de ${clientIP}: No ha hecho login`);
-                return;
-            }
-
-            console.log(`📨 [${ws.islandId}] ${ws.deviceId} (${ws.role}) -> ${message.type}`);
-
-            // 2. Enrutamiento de mensajes
-            routeMessage(ws, message);
 
         } catch (error) {
             console.error('❌ Error procesando mensaje:', error);
@@ -61,139 +90,174 @@ server.on('connection', function connection(ws, request) {
     });
 
     ws.on('close', function () {
-        if (ws.isLogued && ws.islandId && ws.deviceId) {
-            console.log(`🔌 Desconectado: ${ws.deviceId} de isla ${ws.islandId}`);
-            // Eliminar de la lista de islas
-            if (islands[ws.islandId] && islands[ws.islandId][ws.deviceId]) {
-                delete islands[ws.islandId][ws.deviceId];
-
-                // Si la isla queda vacía, borrarla (opcional)
-                if (Object.keys(islands[ws.islandId]).length === 0) {
-                    delete islands[ws.islandId];
-                }
-            }
-        } else {
-            console.log(`🔌 Desconexión anónima de ${clientIP}`);
-        }
+        console.log(`🔌 Desconectado: ${ws.deviceId || 'Anónimo'} (${ws.userId || '?'})`);
+        clients.delete(ws);
+        // Podríamos marcar last_seen en DB aquí
     });
 });
 
-function handleLogin(ws, message) {
-    const { islandId, deviceId, role } = message;
+// 1. Registro del Dispositivo (Hardware)
+function handleDeviceRegister(ws, msg) {
+    // msg: { type: 'register_device', deviceId: 'uuid', brand: '...', model: '...', os: '...' }
+    const { deviceId, brand, model, os, appVersion } = msg;
 
-    if (!islandId || !deviceId) {
-        console.error('❌ Login fallido: Faltan datos', message);
-        return;
+    if (!deviceId) return;
+
+    if (!devicesDB[deviceId]) {
+        console.log(`🆕 Nuevo Dispositivo registrado: ${brand} ${model} (${deviceId})`);
+        devicesDB[deviceId] = {
+            deviceId,
+            brand,
+            model,
+            os,
+            appVersion,
+            createdAt: Date.now()
+        };
+    } else {
+        // Actualizar metadatos
+        devicesDB[deviceId].brand = brand;
+        devicesDB[deviceId].model = model;
+        devicesDB[deviceId].os = os;
+        devicesDB[deviceId].appVersion = appVersion;
+        devicesDB[deviceId].lastSeen = Date.now();
     }
+    saveDevices();
 
-    // Inicializar isla si no existe
-    if (!islands[islandId]) {
-        islands[islandId] = {};
-        console.log(`🏝️ Nueva Isla creada: ${islandId}`);
-    }
-
-    // Registrar dispositivo
-    islands[islandId][deviceId] = {
-        ws: ws,
-        role: role || 'CHILD'
-    };
-
-    // Actualizar metadatos del socket
-    ws.isLogued = true;
-    ws.islandId = islandId;
     ws.deviceId = deviceId;
-    ws.role = role || 'CHILD';
-
-    console.log(`✅ Login exitoso: ${deviceId} (${ws.role}) unido a isla ${islandId}`);
-
-    // Enviar configuración de servidores ICE (STUN/TURN)
-    const iceServers = config.ice_servers || [];
-    if (iceServers.length > 0) {
-        ws.send(JSON.stringify({
-            type: 'ice-servers',
-            servers: iceServers
-        }));
-        console.log(`❄️ Enviados ${iceServers.length} servidores ICE a ${deviceId}`);
-    }
-
-    // Enviar confirmación (opcional)
-    ws.send(JSON.stringify({ type: 'login-success', message: 'Conectado a la isla' }));
+    ws.send(JSON.stringify({ type: 'register_success', message: 'Dispositivo reconocido' }));
 }
 
-function routeMessage(senderWs, message) {
-    const island = islands[senderWs.islandId];
-    if (!island) return;
+// 2. Login de Usuario (Persona + Rol + Familia)
+function handleUserLogin(ws, msg) {
+    // msg: { type: 'login_user', deviceId: '...', userId: '...', name: 'Carlos', familyId: 'FamA', role: 'FATHER' }
+    const { deviceId, userId, name, familyId, role } = msg;
 
-    // CASO A: Llamar a Mamá (target implícito)
-    if (message.target === 'MOTHER') {
-        console.log(`📞 Buscando MADRE en isla ${senderWs.islandId}...`);
-        let motherFound = false;
+    if (!deviceId || !ws.deviceId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Primero debe registrar dispositivo' }));
+        return;
+    }
 
-        Object.values(island).forEach(client => {
-            if (client.role === 'MOTHER' && client.ws !== senderWs) {
-                if (client.ws.readyState === WebSocket.OPEN) {
-                    client.ws.send(JSON.stringify(message));
-                    console.log(`📤 Mensaje reenviado a MADRE`);
-                    motherFound = true;
-                }
-            }
-        });
+    // Actualizar o Crear Usuario permanentemente
+    usersDB[userId] = {
+        userId,
+        name,
+        familyId,
+        role,     // 'GRANDFATHER', 'FATHER', 'CHILD'
+        deviceId  // Dispositivo actual
+    };
+    saveUsers();
 
-        if (!motherFound) {
-            console.warn(`⚠️ No se encontró MADRE conectada en isla ${senderWs.islandId}`);
+    // Actualizar sesión en memoria RAM (Socket)
+    ws.userId = userId;
+    ws.familyId = familyId;
+    ws.role = role.toUpperCase(); // Normalizar
+    ws.userName = name;
+
+    console.log(`✅ Login: ${name} (${ws.role}) en Familia ${familyId}`);
+
+    ws.send(JSON.stringify({
+        type: 'login_success',
+        user: usersDB[userId],
+        iceServers: config.ice_servers || []
+    }));
+
+    // Notificar a otros de la MISMA familia que alguien entró (opcional, refresca listas)
+    broadcastOnlineUpdate(familyId);
+}
+
+// 3. Obtener Usuarios Online (Filtrado por Familia y Reglas)
+function handleGetOnlineUsers(ws) {
+    if (!ws.userId || !ws.familyId) return;
+
+    const availableUsers = [];
+
+    clients.forEach(client => {
+        // 1. Descartar uno mismo
+        if (client === ws) return;
+        // 2. Verificar que esté autenticado
+        if (!client.userId) return;
+
+        // 3. REGLA DE ORO: Aislamiento Familiar
+        if (client.familyId !== ws.familyId) return;
+
+        // 4. REGLA DE JERARQUIA (Quién puede ver a quién)
+        if (canCall(ws.role, client.role)) {
+            availableUsers.push({
+                userId: client.userId,
+                name: client.userName,
+                role: client.role,
+                status: 'online'
+            });
         }
-        return;
-    }
+    });
 
-    // CASO A.2: BROADCAST EXPLÍCITO (Llamar a todos)
-    if (message.target === 'BROADCAST') {
-        console.log(`📢 BROADCAST solicitado en isla ${senderWs.islandId}`);
-        Object.values(island).forEach(client => {
-            if (client.ws !== senderWs && client.ws.readyState === WebSocket.OPEN) {
-                client.ws.send(JSON.stringify(message));
-                console.log(`📤 Broadcast a ${client.role} (${client.deviceId})`);
-            }
-        });
-        return;
-    }
+    ws.send(JSON.stringify({
+        type: 'online_users',
+        users: availableUsers
+    }));
+}
 
-    // CASO A.2: Routing por Rol (ej: targetRole = 'CHILD')
-    if (message.targetRole) {
-        console.log(`📞 Buscando rol ${message.targetRole} en isla ${senderWs.islandId}...`);
-        let found = false;
+// 4. Enrutamiento de Señalización (P2P)
+function routeSignalingMessage(senderWs, msg) {
+    const targetUserId = msg.targetUserId;
+    if (!targetUserId) return;
 
-        Object.values(island).forEach(client => {
-            if (client.role === message.targetRole && client.ws !== senderWs) {
-                if (client.ws.readyState === WebSocket.OPEN) {
-                    client.ws.send(JSON.stringify(message));
-                    console.log(`📤 Mensaje reenviado a ${client.role} (${client.deviceId})`);
-                    found = true;
-                }
-            }
-        });
-
-        if (!found) {
-            console.warn(`⚠️ No se encontraron dispositivos con rol ${message.targetRole} en isla ${senderWs.islandId}`);
+    // Buscar socket destino
+    let targetWs = null;
+    for (const client of clients) {
+        if (client.userId === targetUserId) {
+            targetWs = client;
+            break;
         }
-        return;
     }
 
-    // CASO B: Target específico (si se implementa lógica de llamar a hijo específico)
-    if (message.targetDeviceId) {
-        const targetClient = island[message.targetDeviceId];
-        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
-            targetClient.ws.send(JSON.stringify(message));
-            console.log(`📤 Mensaje enviado directo a ${message.targetDeviceId}`);
+    if (targetWs) {
+        // Verificar reglas de familia nuevamente por seguridad
+        if (targetWs.familyId !== senderWs.familyId) {
+            console.warn(`🛑 Bloqueado intento llamada entre familias: ${senderWs.familyId} -> ${targetWs.familyId}`);
+            return;
         }
-        return;
+
+        // Reenviar mensaje con senderId y senderName para que sepa quién llama
+        msg.senderId = senderWs.userId;
+        msg.senderName = senderWs.userName || "Alguien"; // Asegurar que siempre hay un nombre
+        targetWs.send(JSON.stringify(msg));
+        console.log(`📡 Señal ${msg.type}: ${senderWs.userName} -> ${targetWs.userName}`);
+    } else {
+        console.warn(`⚠️ Usuario destino no encontrado o offline: ${targetUserId}`);
+    }
+}
+
+// --- Matriz de Permisos ---
+function canCall(myRole, targetRole) {
+    const ME = myRole.toUpperCase();
+    const TARGET = targetRole.toUpperCase();
+
+    // GRANDFATHER: Habla con todos
+    if (ME === 'GRANDFATHER') return true;
+
+    // FATHER / MOTHER: Habla con todos
+    if (ME === 'FATHER' || ME === 'MOTHER') return true;
+
+    // CHILD:
+    if (ME === 'CHILD') {
+        // Puede hablar con Abuelos y Padres
+        if (TARGET === 'GRANDFATHER' || TARGET === 'FATHER' || TARGET === 'MOTHER') return true;
+
+        // NO puede hablar con otros niños (según requerimiento original)
+        // "Nietos no hablan sino con su abuelos o los otros padres"
+        if (TARGET === 'CHILD') return false;
     }
 
-    // CASO C: Broadcast (comportamiento por defecto para señalización WebRTC simple)
-    // Reenvía a TODOS los demás en la isla (útil si hay múltiples madres o hijos escuchando)
-    Object.values(island).forEach(client => {
-        if (client.ws !== senderWs && client.ws.readyState === WebSocket.OPEN) {
-            client.ws.send(JSON.stringify(message));
-            console.log(`📤 Broadcast a ${client.role}`);
+    return false; // Por defecto restrictivo
+}
+
+function broadcastOnlineUpdate(familyId) {
+    // Avisar a todos los de la familia que actualicen su lista
+    clients.forEach(client => {
+        if (client.familyId === familyId && client.userId) {
+            // Enviamos un trigger para que ellos pidan la lista de nuevo
+            client.send(JSON.stringify({ type: 'refresh_users' }));
         }
     });
 }
