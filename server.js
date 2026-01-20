@@ -1,7 +1,7 @@
 // Servidor de señalización WebRTC con Arquitectura de Islas y Jerarquía Familiar
 const WebSocket = require('ws');
 const fs = require('fs');
-const crypto = require('crypto');
+const mongoose = require('mongoose');
 
 // --- Configuración ---
 let config = { port: 8080 };
@@ -13,39 +13,65 @@ try {
     console.warn('⚠️ No se encontró server_config.json, usando valores por defecto');
 }
 
+// --- Conexión a MongoDB Atlas ---
+const MONGO_USER = "uservistaai";
+const MONGO_PASS = encodeURIComponent("Diablo.2026...");
+const MONGO_URI = `mongodb+srv://${MONGO_USER}:${MONGO_PASS}@cluster0.nbqlctb.mongodb.net/vistaai?retryWrites=true&w=majority`;
+
+mongoose.connect(MONGO_URI)
+    .then(() => console.log('🍃 Conectado a MongoDB Atlas (DB: vistaai)'))
+    .catch(err => console.error('❌ Error conectando a MongoDB:', err));
+
+// --- Esquemas de MongoDB (Unificados en vistaaicollection) ---
+const DeviceSchema = new mongoose.Schema({
+    type: { type: String, default: 'device' },
+    deviceId: { type: String, required: true },
+    brand: String,
+    model: String,
+    os: String,
+    appVersion: String,
+    createdAt: { type: Date, default: Date.now },
+    lastSeen: { type: Date, default: Date.now }
+}, { collection: 'vistaaicollection' });
+
+// Índice único PARCIAL: solo único para dispositivos
+DeviceSchema.index({ deviceId: 1 }, { unique: true, partialFilterExpression: { type: 'device' } });
+
+const UserSchema = new mongoose.Schema({
+    type: { type: String, default: 'user' },
+    userId: { type: String, required: true },
+    name: String,
+    familyId: { type: String, index: true },
+    role: String,
+    deviceId: String,
+    lastLogin: { type: Date, default: Date.now }
+}, { collection: 'vistaaicollection' });
+
+// Índice único PARCIAL: solo único para usuarios
+UserSchema.index({ userId: 1 }, { unique: true, partialFilterExpression: { type: 'user' } });
+
+const Device = mongoose.model('Device', DeviceSchema);
+const User = mongoose.model('User', UserSchema);
+
+// Limpiar índices antiguos que causan conflicto y sincronizar los nuevos
+async function syncAndCleanIndexes() {
+    try {
+        await Device.collection.dropIndexes();
+        console.log('🧹 Índices antiguos eliminados de vistaaicollection');
+        await Device.syncIndexes();
+        await User.syncIndexes();
+        console.log('✅ Nuevos índices parciales configurados');
+    } catch (e) {
+        console.warn('⚠️ Nota sobre índices:', e.message);
+    }
+}
+syncAndCleanIndexes();
+
 const PORT = process.env.PORT || config.port || 8080;
 const server = new WebSocket.Server({ port: PORT });
 console.log(`🚀 Servidor WebRTC (Familia/Roles) iniciado en puerto ${PORT}`);
 
-// --- Persistencia (Mini-DB JSON) ---
-const DEVICES_FILE = './devices.json';
-const USERS_FILE = './users.json';
-
-let devicesDB = {}; // { device_id: { brand, model, os, ... } }
-let usersDB = {};   // { user_id: { name, familyId, role, deviceId } }
-
-function loadDB() {
-    try {
-        if (fs.existsSync(DEVICES_FILE)) devicesDB = JSON.parse(fs.readFileSync(DEVICES_FILE));
-        if (fs.existsSync(USERS_FILE)) usersDB = JSON.parse(fs.readFileSync(USERS_FILE));
-        console.log(`📚 DB cargada: ${Object.keys(devicesDB).length} dispositivos, ${Object.keys(usersDB).length} usuarios`);
-    } catch (e) {
-        console.error('❌ Error cargando DB:', e);
-    }
-}
-loadDB();
-
-function saveDevices() {
-    fs.writeFileSync(DEVICES_FILE, JSON.stringify(devicesDB, null, 2));
-}
-
-function saveUsers() {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(usersDB, null, 2));
-}
-
 // --- Lógica de Negocio ---
-// connections = { socket: ws, deviceId: '...', userId: '...' }
-// Se mantiene referencia en el objeto 'ws' directamente para acceso rápido
 const clients = new Set();
 
 server.on('connection', function connection(ws, request) {
@@ -60,16 +86,17 @@ server.on('connection', function connection(ws, request) {
 
     clients.add(ws);
 
-    ws.on('message', function incoming(data) {
+    ws.on('message', async function incoming(data) {
         try {
             const message = JSON.parse(data.toString());
+            console.log(`📥 [MSG] type: ${message.type} | device: ${ws.deviceId || '?'}`);
 
             switch (message.type) {
                 case 'register_device':
-                    handleDeviceRegister(ws, message);
+                    await handleDeviceRegister(ws, message);
                     break;
                 case 'login_user':
-                    handleUserLogin(ws, message);
+                    await handleUserLogin(ws, message);
                     break;
                 case 'get_online_users':
                     handleGetOnlineUsers(ws);
@@ -92,77 +119,90 @@ server.on('connection', function connection(ws, request) {
     ws.on('close', function () {
         console.log(`🔌 Desconectado: ${ws.deviceId || 'Anónimo'} (${ws.userId || '?'})`);
         clients.delete(ws);
-        // Podríamos marcar last_seen en DB aquí
     });
 });
 
 // 1. Registro del Dispositivo (Hardware)
-function handleDeviceRegister(ws, msg) {
-    // msg: { type: 'register_device', deviceId: 'uuid', brand: '...', model: '...', os: '...' }
+async function handleDeviceRegister(ws, msg) {
     const { deviceId, brand, model, os, appVersion } = msg;
-
     if (!deviceId) return;
 
-    if (!devicesDB[deviceId]) {
-        console.log(`🆕 Nuevo Dispositivo registrado: ${brand} ${model} (${deviceId})`);
-        devicesDB[deviceId] = {
-            deviceId,
+    // Set deviceId early to avoid race conditions with login_user
+    ws.deviceId = deviceId;
+
+    try {
+        const deviceData = {
             brand,
             model,
             os,
             appVersion,
-            createdAt: Date.now()
+            lastSeen: Date.now()
         };
-    } else {
-        // Actualizar metadatos
-        devicesDB[deviceId].brand = brand;
-        devicesDB[deviceId].model = model;
-        devicesDB[deviceId].os = os;
-        devicesDB[deviceId].appVersion = appVersion;
-        devicesDB[deviceId].lastSeen = Date.now();
-    }
-    saveDevices();
 
-    ws.deviceId = deviceId;
-    ws.send(JSON.stringify({ type: 'register_success', message: 'Dispositivo reconocido' }));
+        const device = await Device.findOneAndUpdate(
+            { deviceId },
+            { $set: deviceData },
+            { upsert: true, new: true }
+        ).lean(); // Usar lean() para obtener objeto plano
+
+        console.log(`📱 Dispositivo actualizado/registrado: ${brand} ${model} (${deviceId})`);
+
+        const response = { type: 'register_success', message: 'Dispositivo reconocido' };
+        console.log(`  -> Enviando a cliente:`, response);
+        ws.send(JSON.stringify(response));
+    } catch (err) {
+        console.error('❌ Error registrando dispositivo:', err);
+        ws.send(JSON.stringify({ type: 'error', message: 'Error en base de datos' }));
+    }
 }
 
 // 2. Login de Usuario (Persona + Rol + Familia)
-function handleUserLogin(ws, msg) {
-    // msg: { type: 'login_user', deviceId: '...', userId: '...', name: 'Carlos', familyId: 'FamA', role: 'FATHER' }
+async function handleUserLogin(ws, msg) {
     const { deviceId, userId, name, familyId, role } = msg;
 
     if (!deviceId || !ws.deviceId) {
+        console.warn(`⚠️ Login fallido: Falta deviceId (msg: ${deviceId}, socket: ${ws.deviceId})`);
         ws.send(JSON.stringify({ type: 'error', message: 'Primero debe registrar dispositivo' }));
         return;
     }
 
-    // Actualizar o Crear Usuario permanentemente
-    usersDB[userId] = {
-        userId,
-        name,
-        familyId,
-        role,     // 'GRANDFATHER', 'FATHER', 'CHILD'
-        deviceId  // Dispositivo actual
-    };
-    saveUsers();
+    try {
+        const userData = {
+            userId,
+            name,
+            familyId,
+            role: role.toUpperCase(),
+            deviceId,
+            lastLogin: Date.now()
+        };
 
-    // Actualizar sesión en memoria RAM (Socket)
-    ws.userId = userId;
-    ws.familyId = familyId;
-    ws.role = role.toUpperCase(); // Normalizar
-    ws.userName = name;
+        const user = await User.findOneAndUpdate(
+            { userId },
+            { $set: userData },
+            { upsert: true, new: true }
+        ).lean(); // Usar lean() para obtener objeto plano
 
-    console.log(`✅ Login: ${name} (${ws.role}) en Familia ${familyId}`);
+        // Actualizar sesión en memoria RAM (Socket)
+        ws.userId = userId;
+        ws.familyId = familyId;
+        ws.role = role.toUpperCase();
+        ws.userName = name;
 
-    ws.send(JSON.stringify({
-        type: 'login_success',
-        user: usersDB[userId],
-        iceServers: config.ice_servers || []
-    }));
+        console.log(`✅ Login: ${name} (${ws.role}) en Familia ${familyId}`);
 
-    // Notificar a otros de la MISMA familia que alguien entró (opcional, refresca listas)
-    broadcastOnlineUpdate(familyId);
+        const response = {
+            type: 'login_success',
+            user: user,
+            iceServers: config.ice_servers || []
+        };
+        console.log(`  -> Enviando login_success a cliente ${name}`);
+        ws.send(JSON.stringify(response));
+
+        broadcastOnlineUpdate(familyId);
+    } catch (err) {
+        console.error('❌ Error en login de usuario:', err);
+        ws.send(JSON.stringify({ type: 'error', message: 'Error en base de datos al autenticar' }));
+    }
 }
 
 // 3. Obtener Usuarios Online (Filtrado por Familia y Reglas)
@@ -172,15 +212,10 @@ function handleGetOnlineUsers(ws) {
     const availableUsers = [];
 
     clients.forEach(client => {
-        // 1. Descartar uno mismo
         if (client === ws) return;
-        // 2. Verificar que esté autenticado
         if (!client.userId) return;
-
-        // 3. REGLA DE ORO: Aislamiento Familiar
         if (client.familyId !== ws.familyId) return;
 
-        // 4. REGLA DE JERARQUIA (Quién puede ver a quién)
         if (canCall(ws.role, client.role)) {
             availableUsers.push({
                 userId: client.userId,
@@ -202,7 +237,6 @@ function routeSignalingMessage(senderWs, msg) {
     const targetUserId = msg.targetUserId;
     if (!targetUserId) return;
 
-    // Buscar socket destino
     let targetWs = null;
     for (const client of clients) {
         if (client.userId === targetUserId) {
@@ -212,15 +246,13 @@ function routeSignalingMessage(senderWs, msg) {
     }
 
     if (targetWs) {
-        // Verificar reglas de familia nuevamente por seguridad
         if (targetWs.familyId !== senderWs.familyId) {
             console.warn(`🛑 Bloqueado intento llamada entre familias: ${senderWs.familyId} -> ${targetWs.familyId}`);
             return;
         }
 
-        // Reenviar mensaje con senderId y senderName para que sepa quién llama
         msg.senderId = senderWs.userId;
-        msg.senderName = senderWs.userName || "Alguien"; // Asegurar que siempre hay un nombre
+        msg.senderName = senderWs.userName || "Alguien";
         targetWs.send(JSON.stringify(msg));
         console.log(`📡 Señal ${msg.type}: ${senderWs.userName} -> ${targetWs.userName}`);
     } else {
@@ -233,30 +265,20 @@ function canCall(myRole, targetRole) {
     const ME = myRole.toUpperCase();
     const TARGET = targetRole.toUpperCase();
 
-    // GRANDFATHER: Habla con todos
     if (ME === 'GRANDFATHER') return true;
-
-    // FATHER / MOTHER: Habla con todos
     if (ME === 'FATHER' || ME === 'MOTHER') return true;
 
-    // CHILD:
     if (ME === 'CHILD') {
-        // Puede hablar con Abuelos y Padres
         if (TARGET === 'GRANDFATHER' || TARGET === 'FATHER' || TARGET === 'MOTHER') return true;
-
-        // NO puede hablar con otros niños (según requerimiento original)
-        // "Nietos no hablan sino con su abuelos o los otros padres"
         if (TARGET === 'CHILD') return false;
     }
 
-    return false; // Por defecto restrictivo
+    return false;
 }
 
 function broadcastOnlineUpdate(familyId) {
-    // Avisar a todos los de la familia que actualicen su lista
     clients.forEach(client => {
         if (client.familyId === familyId && client.userId) {
-            // Enviamos un trigger para que ellos pidan la lista de nuevo
             client.send(JSON.stringify({ type: 'refresh_users' }));
         }
     });
