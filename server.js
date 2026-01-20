@@ -22,54 +22,28 @@ mongoose.connect(MONGO_URI)
     .then(() => console.log('🍃 Conectado a MongoDB Atlas (DB: vistaai)'))
     .catch(err => console.error('❌ Error conectando a MongoDB:', err));
 
-// --- Esquemas de MongoDB (Unificados en vistaaicollection) ---
-const DeviceSchema = new mongoose.Schema({
-    type: { type: String, default: 'device' },
-    deviceId: { type: String, required: true },
+// --- Esquema de MongoDB Unificado (vistaaicollection) ---
+const IdentitySchema = new mongoose.Schema({
+    deviceId: { type: String, required: true, unique: true },
+    userId: { type: String, unique: true, sparse: true }, // ID único de usuario/persona
+    name: String,
+    familyId: { type: String, index: true },
+    role: String,
     brand: String,
     model: String,
     os: String,
     appVersion: String,
-    createdAt: { type: Date, default: Date.now },
     lastSeen: { type: Date, default: Date.now }
 }, { collection: 'vistaaicollection' });
 
-// Índice único PARCIAL: solo único para dispositivos
-DeviceSchema.index({ deviceId: 1 }, { unique: true, partialFilterExpression: { type: 'device' } });
+const Identity = mongoose.model('Identity', IdentitySchema);
 
-const UserSchema = new mongoose.Schema({
-    type: { type: String, default: 'user' },
-    userId: { type: String, required: true },
-    name: String,
-    familyId: { type: String, index: true },
-    role: String,
-    deviceId: String,
-    lastLogin: { type: Date, default: Date.now }
-}, { collection: 'vistaaicollection' });
-
-// Índice único PARCIAL: solo único para usuarios
-UserSchema.index({ userId: 1 }, { unique: true, partialFilterExpression: { type: 'user' } });
-
-const Device = mongoose.model('Device', DeviceSchema);
-const User = mongoose.model('User', UserSchema);
-
-// Limpiar índices antiguos que causan conflicto y sincronizar los nuevos
-async function syncAndCleanIndexes() {
-    try {
-        await Device.collection.dropIndexes();
-        console.log('🧹 Índices antiguos eliminados de vistaaicollection');
-        await Device.syncIndexes();
-        await User.syncIndexes();
-        console.log('✅ Nuevos índices parciales configurados');
-    } catch (e) {
-        console.warn('⚠️ Nota sobre índices:', e.message);
-    }
-}
-syncAndCleanIndexes();
+// Sincronizar índices para asegurar limpieza
+Identity.syncIndexes();
 
 const PORT = process.env.PORT || config.port || 8080;
 const server = new WebSocket.Server({ port: PORT });
-console.log(`🚀 Servidor WebRTC (Familia/Roles) iniciado en puerto ${PORT}`);
+console.log(`🚀 Servidor WebRTC (Jerarquía Unificada) iniciado en puerto ${PORT}`);
 
 // --- Lógica de Negocio ---
 const clients = new Set();
@@ -89,7 +63,7 @@ server.on('connection', function connection(ws, request) {
     ws.on('message', async function incoming(data) {
         try {
             const message = JSON.parse(data.toString());
-            console.log(`📥 [MSG] type: ${message.type} | device: ${ws.deviceId || '?'}`);
+            console.log(`📥 [MSG] type: ${message.type} | user: ${ws.userName || '?'}`);
 
             switch (message.type) {
                 case 'register_device':
@@ -108,7 +82,7 @@ server.on('connection', function connection(ws, request) {
                     routeSignalingMessage(ws, message);
                     break;
                 default:
-                    console.warn(`Mensaje desconocido de ${ws.deviceId}: ${message.type}`);
+                    console.warn(`Mensaje desconocido: ${message.type}`);
             }
 
         } catch (error) {
@@ -117,7 +91,7 @@ server.on('connection', function connection(ws, request) {
     });
 
     ws.on('close', function () {
-        console.log(`🔌 Desconectado: ${ws.deviceId || 'Anónimo'} (${ws.userId || '?'})`);
+        console.log(`🔌 Desconectado: ${ws.userName || 'Anónimo'}`);
         clients.delete(ws);
     });
 });
@@ -126,12 +100,10 @@ server.on('connection', function connection(ws, request) {
 async function handleDeviceRegister(ws, msg) {
     const { deviceId, brand, model, os, appVersion } = msg;
     if (!deviceId) return;
-
-    // Set deviceId early to avoid race conditions with login_user
     ws.deviceId = deviceId;
 
     try {
-        const deviceData = {
+        const updateData = {
             brand,
             model,
             os,
@@ -139,30 +111,26 @@ async function handleDeviceRegister(ws, msg) {
             lastSeen: Date.now()
         };
 
-        const device = await Device.findOneAndUpdate(
+        await Identity.findOneAndUpdate(
             { deviceId },
-            { $set: deviceData },
+            { $set: updateData },
             { upsert: true, new: true }
-        ).lean(); // Usar lean() para obtener objeto plano
+        );
 
-        console.log(`📱 Dispositivo actualizado/registrado: ${brand} ${model} (${deviceId})`);
-
-        const response = { type: 'register_success', message: 'Dispositivo reconocido' };
-        console.log(`  -> Enviando a cliente:`, response);
-        ws.send(JSON.stringify(response));
+        console.log(`📱 Dispositivo reconocido: ${brand} ${model} (${deviceId})`);
+        ws.send(JSON.stringify({ type: 'register_success', message: 'Dispositivo reconocido' }));
     } catch (err) {
         console.error('❌ Error registrando dispositivo:', err);
-        ws.send(JSON.stringify({ type: 'error', message: 'Error en base de datos' }));
+        ws.send(JSON.stringify({ type: 'error', message: 'Error en BD dispositivo' }));
     }
 }
 
-// 2. Login de Usuario (Persona + Rol + Familia)
+// 2. Login de Usuario (Vínculo con Persona)
 async function handleUserLogin(ws, msg) {
     const { deviceId, userId, name, familyId, role } = msg;
 
     if (!deviceId || !ws.deviceId) {
-        console.warn(`⚠️ Login fallido: Falta deviceId (msg: ${deviceId}, socket: ${ws.deviceId})`);
-        ws.send(JSON.stringify({ type: 'error', message: 'Primero debe registrar dispositivo' }));
+        ws.send(JSON.stringify({ type: 'error', message: 'Falta registro de hardware' }));
         return;
     }
 
@@ -172,17 +140,16 @@ async function handleUserLogin(ws, msg) {
             name,
             familyId,
             role: role.toUpperCase(),
-            deviceId,
-            lastLogin: Date.now()
+            lastSeen: Date.now()
         };
 
-        const user = await User.findOneAndUpdate(
-            { userId },
+        const doc = await Identity.findOneAndUpdate(
+            { deviceId },
             { $set: userData },
-            { upsert: true, new: true }
-        ).lean(); // Usar lean() para obtener objeto plano
+            { new: true }
+        ).lean();
 
-        // Actualizar sesión en memoria RAM (Socket)
+        // Actualizar sesión en socket
         ws.userId = userId;
         ws.familyId = familyId;
         ws.role = role.toUpperCase();
@@ -190,34 +157,40 @@ async function handleUserLogin(ws, msg) {
 
         console.log(`✅ Login: ${name} (${ws.role}) en Familia ${familyId}`);
 
-        const response = {
+        ws.send(JSON.stringify({
             type: 'login_success',
-            user: user,
+            user: doc,
             iceServers: config.ice_servers || []
-        };
-        console.log(`  -> Enviando login_success a cliente ${name}`);
-        ws.send(JSON.stringify(response));
+        }));
 
         broadcastOnlineUpdate(familyId);
     } catch (err) {
-        console.error('❌ Error en login de usuario:', err);
-        ws.send(JSON.stringify({ type: 'error', message: 'Error en base de datos al autenticar' }));
+        console.error('❌ Error en login:', err);
+        ws.send(JSON.stringify({ type: 'error', message: 'Error en BD login' }));
     }
 }
 
-// 3. Obtener Usuarios Online (Filtrado por Familia y Reglas)
+// 3. Obtener Usuarios Online (DEDUPLICADO Y FILTRADO)
 function handleGetOnlineUsers(ws) {
     if (!ws.userId || !ws.familyId) return;
 
-    const availableUsers = [];
+    // Usar un mapa para deduplicar por userId
+    const userMap = new Map();
 
     clients.forEach(client => {
-        if (client === ws) return;
-        if (!client.userId) return;
+        // REGLAS:
+        // 1. No soy yo mismo (por ID, no por socket)
+        if (client.userId === ws.userId) return;
+        // 2. Debe estar logueado
+        if (!client.userId || !client.familyId) return;
+        // 3. Misma familia
         if (client.familyId !== ws.familyId) return;
+        // 4. Permisos de llamada
+        if (!canCall(ws.role, client.role)) return;
 
-        if (canCall(ws.role, client.role)) {
-            availableUsers.push({
+        // Si ya está en el mapa, ignoramos (evita duplicados si hay reconexiones sucias)
+        if (!userMap.has(client.userId)) {
+            userMap.set(client.userId, {
                 userId: client.userId,
                 name: client.userName,
                 role: client.role,
@@ -228,15 +201,16 @@ function handleGetOnlineUsers(ws) {
 
     ws.send(JSON.stringify({
         type: 'online_users',
-        users: availableUsers
+        users: Array.from(userMap.values())
     }));
 }
 
-// 4. Enrutamiento de Señalización (P2P)
+// 4. Enrutamiento (P2P)
 function routeSignalingMessage(senderWs, msg) {
     const targetUserId = msg.targetUserId;
     if (!targetUserId) return;
 
+    // Buscar socket destino (el primero que encontremos del usuario)
     let targetWs = null;
     for (const client of clients) {
         if (client.userId === targetUserId) {
@@ -246,17 +220,12 @@ function routeSignalingMessage(senderWs, msg) {
     }
 
     if (targetWs) {
-        if (targetWs.familyId !== senderWs.familyId) {
-            console.warn(`🛑 Bloqueado intento llamada entre familias: ${senderWs.familyId} -> ${targetWs.familyId}`);
-            return;
-        }
+        if (targetWs.familyId !== senderWs.familyId) return;
 
         msg.senderId = senderWs.userId;
         msg.senderName = senderWs.userName || "Alguien";
         targetWs.send(JSON.stringify(msg));
         console.log(`📡 Señal ${msg.type}: ${senderWs.userName} -> ${targetWs.userName}`);
-    } else {
-        console.warn(`⚠️ Usuario destino no encontrado o offline: ${targetUserId}`);
     }
 }
 
@@ -267,12 +236,10 @@ function canCall(myRole, targetRole) {
 
     if (ME === 'GRANDFATHER') return true;
     if (ME === 'FATHER' || ME === 'MOTHER') return true;
-
     if (ME === 'CHILD') {
         if (TARGET === 'GRANDFATHER' || TARGET === 'FATHER' || TARGET === 'MOTHER') return true;
-        if (TARGET === 'CHILD') return false;
+        return false;
     }
-
     return false;
 }
 
